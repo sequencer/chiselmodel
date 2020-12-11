@@ -33,10 +33,10 @@ object mytreadle extends dependencies.treadle.build.treadleCrossModule(sv) {
   def firrtlModule: Option[PublishModule] = Some(myfirrtl)
 }
 
-object chiselmodel extends ScalaModule with ScalafmtModule {
+object chiselmodel extends ScalaModule with ScalafmtModule { m =>
   override def scalaVersion = sv
 
-  override def moduleDeps = super.moduleDeps ++ Seq(mychisel3)
+  override def moduleDeps = super.moduleDeps ++ Seq(mychisel3, macros)
 
   override def scalacPluginClasspath = super.scalacPluginClasspath() ++ Agg(
     mychisel3.plugin.jar()
@@ -49,6 +49,13 @@ object chiselmodel extends ScalaModule with ScalafmtModule {
     ivy"com.lihaoyi::pprint:latest.integration",
     ivy"org.scala-lang.modules::scala-xml:latest.integration"
   )
+
+  object macros extends ScalaModule with ScalafmtModule {
+    override def scalaVersion = m.scalaVersion
+    override def ivyDeps = m.ivyDeps() ++ Seq(
+      ivy"${scalaOrganization()}:scala-reflect:${scalaVersion()}"
+    )
+  }
 
   // use scalatest as your test framework
   object tests extends Tests with ScalafmtModule {

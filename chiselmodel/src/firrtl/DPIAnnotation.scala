@@ -8,7 +8,8 @@ case class DPIAnnotation(
   data:      ReferenceTarget,
   condition: ReferenceTarget,
   clock:     ReferenceTarget,
-  reset:     ReferenceTarget)
+  reset:     ReferenceTarget,
+  name:      String)
     extends MultiTargetAnnotation {
   require(
     Set(data.moduleTarget, condition.moduleTarget, clock.moduleTarget).size == 1,
@@ -34,7 +35,8 @@ case class DPIAnnotation(
         newTargets(0).asInstanceOf[ReferenceTarget],
         newTargets(1).asInstanceOf[ReferenceTarget],
         newTargets(2).asInstanceOf[ReferenceTarget],
-        newTargets(3).asInstanceOf[ReferenceTarget]
+        newTargets(3).asInstanceOf[ReferenceTarget],
+        name
       )
     )
 

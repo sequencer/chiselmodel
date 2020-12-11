@@ -6,6 +6,7 @@ import chisel3.internal.sourceinfo.{SourceInfo, UnlocatableSourceInfo}
 import chiselmodel.firrtl._
 import firrtl.Transform
 import firrtl.annotations.Annotation
+import chiselmodel.macros.ValNameImpl
 
 package object chiselmodel {
   implicit val sourceInfo: SourceInfo = UnlocatableSourceInfo
@@ -13,30 +14,34 @@ package object chiselmodel {
   /** Create a SystemVerilog DPI BlackBox for `data`.
     * @param data Data to be accessed by DPI.
     */
-  def dpi(data: Data): Unit = {
-    dpi(data, when.cond, Module.clock, Module.reset)
+  def dpi(data: Data)(implicit valName: ValName): Unit = {
+    dpi(data, when.cond, Module.clock, Module.reset, valName.name)
   }
 
   /** Create a SystemVerilog DPI BlackBox for `data`.
     * @param data Data to be accessed by DPI.
     */
-  def dpi(data: Data, condition: Bool, clock: Clock, reset: Reset): Unit = {
+  def dpi(data: Data, condition: Bool, clock: Clock, reset: Reset, name: String): Unit = {
     requireIsHardware(data)
-
-    val conditionWire = WireDefault(condition).suggestName("DPI_CONDITION_" + data.computeName(None, None).get)
-    val clockWire = WireDefault(clock).suggestName("DPI_CLOCK_" + data.computeName(None, None).get)
-    val resetWire = WireDefault(reset).suggestName("DPI_RESET_" + data.computeName(None, None).get)
+    val dataName = data.computeName(None, None).get
+    val conditionWire = WireDefault(condition).suggestName("DPI_CONDITION_" + dataName)
+    val clockWire = WireDefault(clock).suggestName("DPI_CLOCK_" + dataName)
+    val resetWire = WireDefault(reset).suggestName("DPI_RESET_" + dataName)
     data := DontCare
-    dontTouch(data)
-
     dontTouch(conditionWire)
     dontTouch(clockWire)
     dontTouch(resetWire)
     annotate(new ChiselAnnotation with RunFirrtlTransform {
       override def toFirrtl: Annotation =
-        DPIAnnotation(data.toTarget, conditionWire.toTarget, clockWire.toTarget, resetWire.toTarget)
+        DPIAnnotation(data.toTarget, conditionWire.toTarget, clockWire.toTarget, resetWire.toTarget, name)
       override def transformClass: Class[_ <: Transform] = classOf[DPITransform]
     })
+  }
+
+  case class ValName(name: String)
+
+  object ValName {
+    implicit def materialize(implicit x: ValNameImpl): ValName = ValName(x.name)
   }
 
 }
