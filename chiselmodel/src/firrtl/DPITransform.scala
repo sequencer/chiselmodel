@@ -2,13 +2,12 @@ package chiselmodel.firrtl
 
 import firrtl.Utils.swap
 import firrtl._
-import firrtl.analyses.IRLookup
+import firrtl.analyses.{CircuitGraph, ConnectionGraph, IRLookup, InstanceKeyGraph}
+import firrtl.annotations.TargetToken
 import firrtl.ir._
 import firrtl.options.Dependency
 import firrtl.passes.{ExpandConnects, InferTypes, ResolveFlows, ToWorkingIR}
 import firrtl.stage.TransformManager.TransformDependency
-
-import scala.collection.mutable.ListBuffer
 
 /** DPITransform to add COSIM blackbox to DPI Modules.
   *
@@ -17,6 +16,7 @@ import scala.collection.mutable.ListBuffer
 class DPITransform extends Transform with DependencyAPIMigration {
   // need [[FixFlows]] to fix auto-generated connection.
   override val optionalPrerequisiteOf = Seq(
+    Dependency[VerilogEmitter],
     Dependency(FixFlows)
   )
 
@@ -30,8 +30,11 @@ class DPITransform extends Transform with DependencyAPIMigration {
 
   override protected def execute(state: CircuitState): CircuitState = {
 
+    val circuitGraph = CircuitGraph(state.circuit)
+
+    val connectionGraph = ConnectionGraph(state.circuit)
+
     /** use [[firrtl.analyses.ConnectionGraph]] to to find ir annotated by [[dpiAnnotations]]. */
-    val irLookUp: IRLookup = IRLookup(state.circuit)
 
     /** gather all annoated [[DPIAnnotation]]. */
     val dpiAnnotations = state.annotations.collect { case a: DPIAnnotation => a }
@@ -45,46 +48,98 @@ class DPITransform extends Transform with DependencyAPIMigration {
 
           // modify `module` if it contains [[DPIAnnotation]]
           if (moduleDpiAnnotations.nonEmpty) {
-            val (extModules, statements) = moduleDpiAnnotations.map {
-              // convert DPIAnnotation to port in the `module`
-              case DPIAnnotation(data, condition, clock, reset) =>
-                /** `extModule` name, `defname` and `name` are same since we will construct our own [[ExtModule]]. */
-                val extModuleName = s"DPI_${data.module}_${irLookUp.expr(condition).serialize}".replace(".", "_")
-                val extModule = ExtModule(
-                  info = NoInfo,
-                  name = extModuleName,
-                  ports = Seq(
-                    Port(NoInfo, "clock", Input, irLookUp.tpe(clock)),
-                    Port(NoInfo, "reset", Input, irLookUp.tpe(reset)),
-                    Port(NoInfo, "condition", Input, irLookUp.tpe(condition)),
-                    Port(
-                      NoInfo,
-                      "io",
-                      // get the port direction and flip it.
-                      swap((irLookUp.declaration(data) match {
-                        case p: Port => p
-                        // if not annotate to a [[Port]], throw [[DPIAnnotatedToNoPortTargetException]]
-                        case _ => throw new DPIAnnotatedToNoPortTargetException(data)
-                      }).direction),
-                      irLookUp.tpe(data)
-                    )
-                  ),
-                  defname = extModuleName,
-                  params = Seq.empty
-                )
-                val extModuleInstance = DefInstance(extModuleName, extModuleName)
-                (
-                  extModule,
-                  Seq(
-                    extModuleInstance,
-                    Connect(NoInfo, SubField(Reference(extModuleInstance), "clock"), irLookUp.expr(clock)),
-                    Connect(NoInfo, SubField(Reference(extModuleInstance), "reset"), irLookUp.expr(reset)),
-                    Connect(NoInfo, SubField(Reference(extModuleInstance), "condition"), irLookUp.expr(condition)),
-                    Connect(NoInfo, SubField(Reference(extModuleInstance), "io"), irLookUp.expr(data))
+            val (extModules, statements) = moduleDpiAnnotations
+              .groupBy(_.name)
+              .map {
+                // convert DPIAnnotation to port in the `module`
+                case (name, dpiAnnotations) => {
+                  // make sure only a DPI Annotation can be annotated to one instance.
+                  val pathGroups: Map[Seq[(TargetToken.Instance, TargetToken.OfModule)], Seq[DPIAnnotation]] =
+                    dpiAnnotations.groupBy(_.targets.flatMap(_.flatMap(_.path)).distinct)
+                  if (pathGroups.size != 1) {
+                    throw new DPINameCollapsedException(pathGroups)
+                  }
+                  // make sure annotation of one name shares same clock, reset, condition
+                  val (conditions, clocks, resets) = dpiAnnotations.map {
+                    case DPIAnnotation(_, condition, clock, reset, _) =>
+                      (
+                        circuitGraph.fanInSignals(condition),
+                        circuitGraph.fanInSignals(clock),
+                        circuitGraph.fanInSignals(reset)
+                      )
+                  }.unzip3
+                  // @todo create correspond exceptions
+                  require(conditions.flatten.distinct.size == 1)
+                  require(clocks.flatten.distinct.size == 1)
+                  require(resets.flatten.distinct.size == 1)
+
+                  // construct names
+                  val extModuleName = s"${name}_${dpiAnnotations.head.data.path.map(_._1.value).mkString("_")}"
+                  val extModuleInstance = DefInstance(extModuleName, extModuleName)
+
+                  // @todo check types
+                  val clockType: Type = connectionGraph.irLookup.tpe(dpiAnnotations.head.clock)
+                  val resetType = connectionGraph.irLookup.tpe(dpiAnnotations.head.clock)
+                  val conditionType = connectionGraph.irLookup.tpe(dpiAnnotations.head.clock)
+
+                  val (extModulePorts, newConnections) = dpiAnnotations.map {
+                    case DPIAnnotation(data, condition, clock, reset, _) =>
+                      (
+                        Seq(
+                          Port(NoInfo, "clock", Input, clockType),
+                          Port(NoInfo, "reset", Input, resetType),
+                          Port(NoInfo, "condition", Input, conditionType),
+                          Port(
+                            NoInfo,
+                            // @todo need to handle SubIndex and SubVec (sanitize name)
+                            data.name,
+                            // get the port direction and flip it.
+                            swap((connectionGraph.irLookup.declaration(data) match {
+                              case p: Port => p
+                              // if not annotate to a [[Port]], throw [[DPIAnnotatedToNoPortTargetException]]
+                              case _ => throw new DPIAnnotatedToNoPortTargetException(data)
+                            }).direction),
+                            connectionGraph.irLookup.tpe(data)
+                          )
+                        ),
+                        Seq(
+                          Connect(
+                            NoInfo,
+                            SubField(Reference(extModuleInstance), "clock"),
+                            connectionGraph.irLookup.expr(clock)
+                          ),
+                          Connect(
+                            NoInfo,
+                            SubField(Reference(extModuleInstance), "reset"),
+                            connectionGraph.irLookup.expr(reset)
+                          ),
+                          Connect(
+                            NoInfo,
+                            SubField(Reference(extModuleInstance), "condition"),
+                            connectionGraph.irLookup.expr(condition)
+                          ),
+                          Connect(
+                            NoInfo,
+                            SubField(Reference(extModuleInstance), data.name),
+                            connectionGraph.irLookup.expr(data)
+                          )
+                        )
+                      )
+                  }.unzip
+                  (
+                    ExtModule(
+                      info = NoInfo,
+                      name = extModuleName,
+                      ports = extModulePorts.flatten.distinct,
+                      defname = extModuleName,
+                      params = Seq.empty
+                    ),
+                    extModuleInstance +: newConnections.flatten
                   )
-                )
-            }.unzip
-            Seq(module.copy(body = Block(module.body, statements.flatten: _*))) ++ extModules
+                }
+              }
+              .unzip
+            Seq(module.copy(body = Block(module.body, statements.flatten.toSeq.distinct: _*))) ++ extModules
           } else
             Seq(module)
       }
@@ -93,7 +148,8 @@ class DPITransform extends Transform with DependencyAPIMigration {
     state.copy(
       circuit = state.circuit.copy(
         modules = state.circuit.modules.flatMap(addDPIToModule)
-      )
+      ),
+      annotations = state.annotations.filterNot(_.isInstanceOf[DPIAnnotation])
     )
   }
 }
